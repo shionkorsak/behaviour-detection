@@ -8,6 +8,80 @@ from torchvision import transforms
 from PIL import Image
 from collections import defaultdict, deque
 import numpy as np
+import time
+
+# --- ui & detection config---
+COLOR_BG = (30, 30, 30)
+COLOR_TEXT = (255, 255, 255)
+COLOR_ACCENT = (0, 255, 217)
+COLOR_ALERT = (0, 0, 255)
+COLOR_OK = (0, 255, 0)
+
+def draw_dashboard(frame, active_tracks, track_display, fps):
+    """Draws a professional-looking dashboard overlay on the frame."""
+    h, w = frame.shape[:2]
+    
+    # here is sidebar
+    sidebar_w = 300
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (w - sidebar_w, 0), (w, h), COLOR_BG, -1)
+    alpha = 0.85
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    
+    # sidebar content
+    x_start = w - sidebar_w + 20
+    y_curr = 50
+    
+    # title
+    cv2.putText(frame, "BEHAVIOR MONITOR", (x_start, y_curr), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_ACCENT, 2)
+    y_curr += 40
+    
+    # sidebar's stars
+    num_students = len(active_tracks)
+    cv2.putText(frame, f"Students Detected: {num_students}", (x_start, y_curr), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT, 1)
+    y_curr += 30
+    cv2.putText(frame, f"FPS: {fps:.1f}", (x_start, y_curr), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT, 1)
+    y_curr += 40
+
+    cv2.line(frame, (x_start, y_curr), (w - 20, y_curr), (100, 100, 100), 1)
+    y_curr += 30
+
+    # all active behaviours its detecting
+    cv2.putText(frame, "Active Behaviors:", (x_start, y_curr), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1)
+    y_curr += 30
+
+    # counter
+    behavior_counts = defaultdict(int)
+    sleeping_students = 0
+    
+    for tid in active_tracks:
+        label_txt, _ = track_display.get(tid, ("Unknown", (0,0,0)))
+        label = label_txt.split(":")[0]
+        behavior_counts[label] += 1
+        if label == "Sleeping":
+            sleeping_students += 1
+
+    for label, count in behavior_counts.items():
+        color = COLOR_OK
+        if label in ["Sleeping", "Turning_Around"]:
+            color = COLOR_ALERT
+        
+        text = f"{label}: {count}"
+        cv2.putText(frame, text, (x_start, y_curr), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+        y_curr += 25
+
+    # alert if sleeping because funny
+    if sleeping_students > 0:
+        alert_text = "ALERT: SLEEPING"
+        text_size = cv2.getTextSize(alert_text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
+        cv2.rectangle(frame, (50, 50), (50 + text_size[0] + 20, 50 + text_size[1] + 20), (0, 0, 255), -1)
+        cv2.putText(frame, alert_text, (60, 50 + text_size[1] + 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
 
 class TemporalMeanNet(nn.Module):
     """Mean-pooling temporal head (older checkpoints)."""
@@ -73,14 +147,29 @@ class TemporalConvNet(nn.Module):
 # ========== Device & checkpoint ==========
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 script_dir = os.path.dirname(__file__)
-CKPT_FILE = os.environ.get("BD_CKPT_FILE", "weaken_turning_around.pth")
-MODEL_PATH = os.path.join(
-    script_dir,
-    "..",
-    "models",
-    "convnext_small_in22ft1k",
-    CKPT_FILE,
-)
+candidate_names = [
+    "behavior_detection_final.pth",
+]
+MODEL_PATH = None
+for name in candidate_names:
+    p = os.path.join(script_dir, name)
+    if os.path.exists(p):
+        MODEL_PATH = p
+        break
+    p2 = os.path.join(script_dir, "..", "models", "convnext_small_in22ft1k", name)
+    if os.path.exists(p2):
+        MODEL_PATH = p2
+        break
+
+if MODEL_PATH is None:
+    files = os.listdir(script_dir)
+    raise FileNotFoundError(
+        "No checkpoint found. Tried: {}. Files in script dir: {}".format(
+            ", ".join(candidate_names), files
+        )
+    )
+
+print(f"Loading checkpoint: {MODEL_PATH}")
 ckpt = torch.load(MODEL_PATH, map_location=device)
 
 # Match architecture to checkpoint
@@ -88,7 +177,15 @@ state_dict = ckpt["state_dict"]
 has_temporal_conv = any(k.startswith("temporal_conv") or ".temporal_conv" in k for k in state_dict)
 ModelClass = TemporalConvNet if has_temporal_conv else TemporalMeanNet
 model = ModelClass(ckpt["model_name"], len(ckpt["class_names"])).to(device)
-model.load_state_dict(state_dict)
+
+try:
+    model.load_state_dict(state_dict)
+except RuntimeError as e:
+    print("⚠️ state_dict strict load failed:", e)
+    print("Retrying with strict=False (ignoring unexpected/missing keys)...")
+    load_info = model.load_state_dict(state_dict, strict=False)
+    print(f"Loaded with strict=False. missing_keys={load_info.missing_keys}, unexpected_keys={load_info.unexpected_keys}")
+
 if not has_temporal_conv:
     print("Warning: checkpoint lacks temporal_conv layers; using mean-pooling head.")
 model.eval()
@@ -109,7 +206,7 @@ def build_class_color_map(names):
 
 class_colors = build_class_color_map(class_names)
 CLIP_LEN = int(ckpt["clip_len"])
-print(f"✅ Model loaded: {ckpt['model_name']}")
+print(f"Model loaded: {ckpt['model_name']}")
 print(f"Classes: {class_names}")
 print(f"Class colors (BGR): {class_colors}")
 print(f"Clip length: {CLIP_LEN}")
@@ -157,7 +254,7 @@ SLEEP_CONFIRM_THRESHOLD = 0.8
 SLEEP_CLEAR_THRESHOLD = 0.5
 
 # ========== Video source ==========
-SOURCE = 2
+SOURCE = 0
 cap = cv2.VideoCapture(SOURCE)
 # cap = cv2.VideoCapture("http://your-ip-camera/video")
 
@@ -350,6 +447,9 @@ while True:
             cv2.rectangle(frame, (x1i, y1i), (x2i, y2i), color, 2)
             cv2.putText(frame, f"ID {tid} | {label_txt}", (x1i, max(20, y1i - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+    # Draw the Professional Dashboard
+    draw_dashboard(frame, active_tracks, track_display, fps)
 
     # Show FPS (optional)
     if frame_count == 1:
